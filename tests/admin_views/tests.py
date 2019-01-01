@@ -2,6 +2,7 @@ import datetime
 import os
 import re
 import unittest
+from unittest import mock
 from urllib.parse import parse_qsl, urljoin, urlparse
 
 import pytz
@@ -1733,6 +1734,24 @@ class AdminViewPermissionsTest(TestCase):
         # make sure the view removes test cookie
         self.assertIs(self.client.session.test_cookie_worked(), False)
 
+    @mock.patch('django.contrib.admin.options.InlineModelAdmin.has_change_permission')
+    def test_add_view_with_view_only_inlines(self, has_change_permission):
+        """User with add permission to a section but view-only for inlines."""
+        self.viewuser.user_permissions.add(get_perm(Section, get_permission_codename('add', Section._meta)))
+        self.client.force_login(self.viewuser)
+        # Valid POST creates a new section.
+        data = {
+            'name': 'New obj',
+            'article_set-TOTAL_FORMS': 0,
+            'article_set-INITIAL_FORMS': 0,
+        }
+        response = self.client.post(reverse('admin:admin_views_section_add'), data)
+        self.assertRedirects(response, reverse('admin:index'))
+        self.assertEqual(Section.objects.latest('id').name, data['name'])
+        # InlineModelAdmin.has_change_permission()'s obj argument is always
+        # None during object add.
+        self.assertEqual([obj for (request, obj), _ in has_change_permission.call_args_list], [None, None])
+
     def test_change_view(self):
         """Change view should restrict access and allow users to edit items."""
         change_dict = {'title': 'Ikke fordømt',
@@ -1911,6 +1930,96 @@ class AdminViewPermissionsTest(TestCase):
         self.assertEqual(Article.objects.count(), article_count + 1)
         new_article = Article.objects.latest('id')
         self.assertRedirects(post, reverse('admin:admin_views_article_change', args=(new_article.pk,)))
+
+    def test_change_view_with_view_only_inlines(self):
+        """
+        User with change permission to a section but view-only for inlines.
+        """
+        self.viewuser.user_permissions.add(get_perm(Section, get_permission_codename('change', Section._meta)))
+        self.client.force_login(self.viewuser)
+        # GET shows inlines.
+        response = self.client.get(reverse('admin:admin_views_section_change', args=(self.s1.pk,)))
+        self.assertEqual(len(response.context['inline_admin_formsets']), 1)
+        formset = response.context['inline_admin_formsets'][0]
+        self.assertEqual(len(formset.forms), 3)
+        # Valid POST changes the name.
+        data = {
+            'name': 'Can edit name with view-only inlines',
+            'article_set-TOTAL_FORMS': 3,
+            'article_set-INITIAL_FORMS': 3
+        }
+        response = self.client.post(reverse('admin:admin_views_section_change', args=(self.s1.pk,)), data)
+        self.assertRedirects(response, reverse('admin:admin_views_section_changelist'))
+        self.assertEqual(Section.objects.get(pk=self.s1.pk).name, data['name'])
+        # Invalid POST reshows inlines.
+        del data['name']
+        response = self.client.post(reverse('admin:admin_views_section_change', args=(self.s1.pk,)), data)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context['inline_admin_formsets']), 1)
+        formset = response.context['inline_admin_formsets'][0]
+        self.assertEqual(len(formset.forms), 3)
+
+    def test_change_view_with_view_and_add_inlines(self):
+        """User has view and add permissions on the inline model."""
+        self.viewuser.user_permissions.add(get_perm(Section, get_permission_codename('change', Section._meta)))
+        self.viewuser.user_permissions.add(get_perm(Article, get_permission_codename('add', Article._meta)))
+        self.client.force_login(self.viewuser)
+        # GET shows inlines.
+        response = self.client.get(reverse('admin:admin_views_section_change', args=(self.s1.pk,)))
+        self.assertEqual(len(response.context['inline_admin_formsets']), 1)
+        formset = response.context['inline_admin_formsets'][0]
+        self.assertEqual(len(formset.forms), 6)
+        # Valid POST creates a new article.
+        data = {
+            'name': 'Can edit name with view-only inlines',
+            'article_set-TOTAL_FORMS': 6,
+            'article_set-INITIAL_FORMS': 3,
+            'article_set-3-id': [''],
+            'article_set-3-title': ['A title'],
+            'article_set-3-content': ['Added content'],
+            'article_set-3-date_0': ['2008-3-18'],
+            'article_set-3-date_1': ['11:54:58'],
+            'article_set-3-section': [str(self.s1.pk)],
+        }
+        response = self.client.post(reverse('admin:admin_views_section_change', args=(self.s1.pk,)), data)
+        self.assertRedirects(response, reverse('admin:admin_views_section_changelist'))
+        self.assertEqual(Section.objects.get(pk=self.s1.pk).name, data['name'])
+        self.assertEqual(Article.objects.count(), 4)
+        # Invalid POST reshows inlines.
+        del data['name']
+        response = self.client.post(reverse('admin:admin_views_section_change', args=(self.s1.pk,)), data)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context['inline_admin_formsets']), 1)
+        formset = response.context['inline_admin_formsets'][0]
+        self.assertEqual(len(formset.forms), 6)
+
+    def test_change_view_with_view_and_delete_inlines(self):
+        """User has view and delete permissions on the inline model."""
+        self.viewuser.user_permissions.add(get_perm(Section, get_permission_codename('change', Section._meta)))
+        self.client.force_login(self.viewuser)
+        data = {
+            'name': 'Name is required.',
+            'article_set-TOTAL_FORMS': 6,
+            'article_set-INITIAL_FORMS': 3,
+            'article_set-0-id': [str(self.a1.pk)],
+            'article_set-0-DELETE': ['on'],
+        }
+        # Inline POST details are ignored without delete permission.
+        response = self.client.post(reverse('admin:admin_views_section_change', args=(self.s1.pk,)), data)
+        self.assertRedirects(response, reverse('admin:admin_views_section_changelist'))
+        self.assertEqual(Article.objects.count(), 3)
+        # Deletion successful when delete permission is added.
+        self.viewuser.user_permissions.add(get_perm(Article, get_permission_codename('delete', Article._meta)))
+        data = {
+            'name': 'Name is required.',
+            'article_set-TOTAL_FORMS': 6,
+            'article_set-INITIAL_FORMS': 3,
+            'article_set-0-id': [str(self.a1.pk)],
+            'article_set-0-DELETE': ['on'],
+        }
+        response = self.client.post(reverse('admin:admin_views_section_change', args=(self.s1.pk,)), data)
+        self.assertRedirects(response, reverse('admin:admin_views_section_changelist'))
+        self.assertEqual(Article.objects.count(), 2)
 
     def test_delete_view(self):
         """Delete view should restrict access and actually delete items."""
